@@ -40,6 +40,9 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
+// Add state management for user onboarding
+const userOnboardingState = new Map();
+
 /**
  * Get or create user by phone number
  * @param {string} phone - Phone number in format 'whatsapp:+1234567890'
@@ -91,23 +94,25 @@ async function getOrCreateUser(phone) {
   }
 }
 
-/**
- * Send WhatsApp message using Twilio
- * @param {string} to - Phone number in format 'whatsapp:+1234567890'
- * @param {string} message - Message to send
- */
-async function sendWhatsAppMessage(to, message) {
+// Add rate limit handling
+const sendWhatsAppMessage = async (to, body, retries = 3) => {
   try {
-    await twilioClient.messages.create({
-      body: message,
+    const message = await twilioClient.messages.create({
+      body,
       from: `whatsapp:${process.env.TWILIO_PHONE_NUMBER}`,
-      to: to
+      to: `whatsapp:${to}`
     });
+    return message;
   } catch (error) {
-    console.error('Error sending WhatsApp message:', error);
+    if (error.code === 63038 && retries > 0) {
+      // Rate limit hit, wait and retry
+      console.log(`Rate limit hit, retrying in 1 second... (${retries} retries left)`);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      return sendWhatsAppMessage(to, body, retries - 1);
+    }
     throw error;
   }
-}
+};
 
 // Health check endpoint
 app.get('/api/health', async (req, res) => {
@@ -140,101 +145,149 @@ app.get('/api/health', async (req, res) => {
 // Webhook for WhatsApp messages via Twilio
 app.post('/api/webhook', async (req, res) => {
   try {
-    // Log the entire request body for debugging
-    console.log('Received webhook request:', {
-      body: req.body,
-      headers: req.headers,
-      contentType: req.headers['content-type']
-    });
+    const { Body, From, MessageStatus, MessageSid } = req.body;
+    console.log('Received webhook:', req.body);
 
-    const messageSid = req.body.MessageSid;
-    const from = req.body.From; // format: 'whatsapp:+1234567890'
-    const numMedia = parseInt(req.body.NumMedia || '0', 10);
-    const body = req.body.Body;
-    let imageUrl = null;
-    let extractedText = null;
-    let parsedReceipt = null;
+    // Handle message status updates
+    if (MessageStatus) {
+      console.log(`Message ${MessageSid} status: ${MessageStatus}`);
+      return res.sendStatus(200);
+    }
 
-    console.log('Parsed message details:', {
-      messageSid,
-      from,
-      numMedia,
-      body
-    });
+    // Extract phone number from From field
+    const phone = From.replace('whatsapp:', '');
+    console.log('Processing message from:', phone);
 
-    if (numMedia > 0) {
-      // Twilio sends MediaUrl{N} and MediaContentType{N} for each media
-      // We'll just take the first image
-      imageUrl = req.body.MediaUrl0;
-      
-      try {
-        // Extract text from the image using Google Cloud Vision
-        extractedText = await extractTextFromImage(imageUrl);
-        console.log('Extracted text from image:', extractedText);
+    // Check if this is a new user joining
+    if (Body.toLowerCase().includes('join')) {
+      // Check if user exists
+      const { data: existingUser, error: userError } = await supabase
+        .from('users')
+        .select('*')
+        .eq('phone', phone)
+        .single();
 
-        if (extractedText) {
-          // Parse the extracted text using AI
-          parsedReceipt = await parseReceiptWithAI(extractedText);
-          console.log('Parsed receipt:', parsedReceipt);
+      if (userError && userError.code !== 'PGRST116') {
+        throw userError;
+      }
 
-          // Get or create user
-          const userId = await getOrCreateUser(from);
+      if (existingUser) {
+        // User exists, send welcome back message
+        await sendWhatsAppMessage(phone, `Welcome back, ${existingUser.name}! 👋\n\nYou can send me a receipt to track your expenses.`);
+      } else {
+        // New user, start onboarding
+        userOnboardingState.set(phone, {
+          step: 'name',
+          data: {}
+        });
 
-          const now = new Date().toISOString();
+        await sendWhatsAppMessage(phone, "Welcome to ExpenseBot! 👋\n\nLet's get you set up. What's your name?");
+      }
+      return res.sendStatus(200);
+    }
 
-          // Save to Supabase
-          const { data: expense, error: saveError } = await supabase
-            .from('expenses')
+    // Handle onboarding responses
+    const onboardingState = userOnboardingState.get(phone);
+    if (onboardingState) {
+      switch (onboardingState.step) {
+        case 'name':
+          // Save name and ask for email
+          onboardingState.data.name = Body.trim();
+          onboardingState.step = 'email';
+          userOnboardingState.set(phone, onboardingState);
+
+          await sendWhatsAppMessage(phone, `Thanks ${onboardingState.data.name}! What's your email address?`);
+          break;
+
+        case 'email':
+          // Validate email format
+          const email = Body.trim();
+          const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+          
+          if (!emailRegex.test(email)) {
+            await sendWhatsAppMessage(phone, "That doesn't look like a valid email address. Please try again:");
+            return res.sendStatus(200);
+          }
+
+          // Save user data
+          const { data: newUser, error: createError } = await supabase
+            .from('users')
             .insert([
               {
-                id: crypto.randomUUID(), // Generate UUID for the id field
-                user_id: userId,
-                image_url: imageUrl,
-                merchant: parsedReceipt.merchant,
-                amount: parsedReceipt.amount,
-                date: parsedReceipt.date,
-                category: parsedReceipt.category,
-                currency: parsedReceipt.currency,
-                language: parsedReceipt.language,
-                status: 'pending', // Default status
-                created_at: now,
-                updated_at: now
+                id: crypto.randomUUID(),
+                phone,
+                name: onboardingState.data.name,
+                email,
+                company_id: 'default',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString()
               }
             ])
             .select()
             .single();
 
-          if (saveError) throw saveError;
+          if (createError) {
+            throw createError;
+          }
 
-          // Send success message
-          await sendWhatsAppMessage(from, "✅ Receipt saved. Want a summary of this week?");
-        }
-      } catch (error) {
-        console.error('Error processing image:', error);
-        await sendWhatsAppMessage(from, "❌ Sorry, I couldn't process your receipt. Please try again.");
-        throw error;
+          // Clear onboarding state
+          userOnboardingState.delete(phone);
+
+          // Send welcome message
+          await sendWhatsAppMessage(phone, `Great! You're all set up, ${newUser.name}! 🎉\n\nYou can now send me receipts to track your expenses. Just take a photo of your receipt and send it to me.`);
+          break;
       }
-
-      // Respond to webhook
-      return res.status(200).json({
-        message: 'Image received and processed',
-        phone: from,
-        image_url: imageUrl,
-        extracted_text: extractedText,
-        parsed_receipt: parsedReceipt
-      });
-    } else {
-      // No image, just log the phone number and message
-      console.log(`Received message from ${from}: ${body}`);
-      return res.status(200).json({
-        message: 'Text message received',
-        phone: from,
-        body: body
-      });
+      return res.sendStatus(200);
     }
+
+    // Handle receipt processing for existing users
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('*')
+      .eq('phone', phone)
+      .single();
+
+    if (userError) {
+      if (userError.code === 'PGRST116') {
+        // User not found, prompt to join
+        await sendWhatsAppMessage(phone, "Welcome! To get started, please send 'join' to begin setting up your account.");
+      } else {
+        throw userError;
+      }
+      return res.sendStatus(200);
+    }
+
+    // Process receipt image
+    if (req.body.NumMedia === '1' && req.body.MediaContentType0.startsWith('image/')) {
+      // ... existing receipt processing code ...
+    } else {
+      // Handle text messages
+      const lowerBody = Body.toLowerCase();
+      
+      if (lowerBody.includes('summary')) {
+        // Extract period from message
+        let period = 'week';
+        if (lowerBody.includes('month')) period = 'month';
+        if (lowerBody.includes('year') || lowerBody.includes('ytd')) period = 'ytd';
+        
+        // Redirect to summary endpoint
+        const summaryUrl = `${req.protocol}://${req.get('host')}/summary/${phone}?period=${period}`;
+        const response = await fetch(summaryUrl);
+        const data = await response.json();
+        
+        if (!response.ok) {
+          throw new Error(data.error || 'Failed to generate summary');
+        }
+      } else {
+        // Send help message
+        await sendWhatsAppMessage(phone, `Hi ${user.name}! 👋\n\nI can help you track your expenses. Just send me a photo of your receipt, or type 'summary' to see your spending overview.\n\nYou can also try:\n- 'summary month' for monthly view\n- 'summary year' for year-to-date view`);
+      }
+    }
+
+    res.sendStatus(200);
   } catch (error) {
-    console.error('Webhook error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Error processing webhook:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -384,11 +437,7 @@ app.get('/summary/:phone', async (req, res) => {
       const noExpensesMessage = `You haven't recorded any expenses in the ${periodText}. Send me a receipt to get started! 📝`;
       
       // Send message via WhatsApp
-      const message = await twilioClient.messages.create({
-        body: noExpensesMessage,
-        from: `whatsapp:${twilioWhatsAppNumber}`,
-        to: `whatsapp:${phone}`
-      });
+      const message = await sendWhatsAppMessage(phone, noExpensesMessage);
 
       return res.json({ 
         success: true, 
@@ -473,11 +522,7 @@ Keep the tone friendly and conversational. Use markdown formatting for better re
     const summary = completion.choices[0].message.content;
 
     // Send summary via WhatsApp
-    const message = await twilioClient.messages.create({
-      body: summary,
-      from: `whatsapp:${twilioWhatsAppNumber}`,
-      to: `whatsapp:${phone}`
-    });
+    const message = await sendWhatsAppMessage(phone, summary);
 
     res.json({ 
       success: true, 
