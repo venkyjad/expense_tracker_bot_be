@@ -51,13 +51,14 @@ const userOnboardingState = new Map();
 async function getOrCreateUser(phone) {
   try {
     // Remove 'whatsapp:' prefix if present
-    const cleanPhone = phone.replace('whatsapp:', '');
+    // const cleanPhone = phone.replace('whatsapp:', '');
     
     // Check if user exists
+    console.log('getOrCreateUser,phone-->', phone);
     const { data: existingUser, error: fetchError } = await supabase
       .from('users')
       .select('id')
-      .eq('phone', cleanPhone)
+      .eq('phone', phone)
       .single();
 
     if (fetchError && fetchError.code !== 'PGRST116') { // PGRST116 is "no rows returned"
@@ -76,7 +77,7 @@ async function getOrCreateUser(phone) {
       .insert([
         {
           id: crypto.randomUUID(), // Generate UUID for the id field
-          phone: cleanPhone,
+          phone: phone,
           name: 'WhatsApp User', // Default name
           company_id: 'default', // Default company
           created_at: now,
@@ -151,7 +152,8 @@ app.post('/api/webhook', async (req, res) => {
     // Handle message status updates
     if (MessageStatus) {
       console.log(`Message ${MessageSid} status: ${MessageStatus}`);
-      return res.sendStatus(200);
+      // return res.sendStatus(200);
+      return;
     }
 
     // Extract phone number from From field
@@ -181,9 +183,10 @@ app.post('/api/webhook', async (req, res) => {
           data: {}
         });
 
-        await sendWhatsAppMessage(phone, "Welcome to ExpenseBot! 👋\n\nLet's get you set up. What's your name?");
+        await sendWhatsAppMessage(phone, "Welcome to Reimburzi! 👋\n\nLet's get you set up. What's your name?");
       }
-      return res.sendStatus(200);
+      // return res.sendStatus(200);
+      return
     }
 
     // Handle onboarding responses
@@ -206,7 +209,8 @@ app.post('/api/webhook', async (req, res) => {
           
           if (!emailRegex.test(email)) {
             await sendWhatsAppMessage(phone, "That doesn't look like a valid email address. Please try again:");
-            return res.sendStatus(200);
+            // return res.sendStatus(200);
+            return;
           }
 
           // Save user data
@@ -237,7 +241,8 @@ app.post('/api/webhook', async (req, res) => {
           await sendWhatsAppMessage(phone, `Great! You're all set up, ${newUser.name}! 🎉\n\nYou can now send me receipts to track your expenses. Just take a photo of your receipt and send it to me.`);
           break;
       }
-      return res.sendStatus(200);
+      // return res.sendStatus(200);
+      return;
     }
 
     // Handle receipt processing for existing users
@@ -254,12 +259,71 @@ app.post('/api/webhook', async (req, res) => {
       } else {
         throw userError;
       }
-      return res.sendStatus(200);
+      // return res.sendStatus(200);
+      return;
     }
 
     // Process receipt image
     if (req.body.NumMedia === '1' && req.body.MediaContentType0.startsWith('image/')) {
       // ... existing receipt processing code ...
+      imageUrl = req.body.MediaUrl0;
+       // format: 'whatsapp:+1234567890'
+      try {
+        // Extract text from the image using Google Cloud Vision
+        extractedText = await extractTextFromImage(imageUrl);
+        console.log('Extracted text from image:', extractedText);
+
+        if (extractedText) {
+          // Parse the extracted text using AI
+          parsedReceipt = await parseReceiptWithAI(extractedText);
+          console.log('Parsed receipt:', parsedReceipt);
+
+          // Get or create user
+          const userId = await getOrCreateUser(phone);
+
+          const now = new Date().toISOString();
+
+          // Save to Supabase
+          const { data: expense, error: saveError } = await supabase
+            .from('expenses')
+            .insert([
+              {
+                id: crypto.randomUUID(), // Generate UUID for the id field
+                user_id: userId,
+                image_url: imageUrl,
+                merchant: parsedReceipt.merchant,
+                amount: parsedReceipt.amount,
+                date: parsedReceipt.date,
+                category: parsedReceipt.category,
+                currency: parsedReceipt.currency,
+                language: parsedReceipt.language,
+                status: 'pending', // Default status
+                created_at: now,
+                updated_at: now
+              }
+            ])
+            .select()
+            .single();
+
+          if (saveError) throw saveError;
+
+          // Send success message
+          await sendWhatsAppMessage(phone, "✅ Receipt saved");
+        }
+      } catch (error) {
+        console.error('Error processing image:', error);
+        await sendWhatsAppMessage(phone, "❌ Sorry, I couldn't process your receipt. Please try again.");
+        throw error;
+      }
+
+      // Respond to webhook
+      return res.status(200).json({
+        message: 'Image received and processed',
+        phone: phone,
+        image_url: imageUrl,
+        extracted_text: extractedText,
+        parsed_receipt: parsedReceipt
+      });
     } else {
       // Handle text messages
       const lowerBody = Body.toLowerCase();
@@ -283,8 +347,8 @@ app.post('/api/webhook', async (req, res) => {
         await sendWhatsAppMessage(phone, `Hi ${user.name}! 👋\n\nI can help you track your expenses. Just send me a photo of your receipt, or type 'summary' to see your spending overview.\n\nYou can also try:\n- 'summary month' for monthly view\n- 'summary year' for year-to-date view`);
       }
     }
-
-    res.sendStatus(200);
+    return;
+    // res.sendStatus(200);
   } catch (error) {
     console.error('Error processing webhook:', error);
     res.status(500).json({ error: error.message });
